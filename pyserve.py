@@ -3,9 +3,11 @@
 
 import argparse
 import base64
+import hmac
 import io
 import json
 import os
+import secrets
 import socket
 import sys
 import urllib.parse
@@ -17,7 +19,9 @@ try:
 except ImportError:
     HAS_QR = False
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
+
+MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100MB
 
 STYLE = """<style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -72,7 +76,17 @@ def format_size(size):
 
 
 def escape_html(text):
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#39;")
+
+
+def safe_path(base_dir, user_path):
+    """Resolve user_path and ensure it stays within base_dir."""
+    resolved = os.path.normpath(os.path.join(base_dir, user_path))
+    resolved = os.path.realpath(resolved)
+    base_real = os.path.realpath(base_dir)
+    if not resolved.startswith(base_real + os.sep) and resolved != base_real:
+        return None
+    return resolved
 
 
 def generate_qr_base64(url):
@@ -97,7 +111,7 @@ def parse_multipart(content_type, body):
             break
 
     if not boundary:
-        return None, None
+        return None, None, None
 
     boundary_bytes = boundary.encode()
     parts = body.split(b"--" + boundary_bytes)
@@ -140,8 +154,8 @@ class PyServeHandler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         if self.auth_token:
-            token = self.headers.get("X-Auth-Token") or self._get_query_param("token")
-            if token != self.auth_token:
+            token = self.headers.get("X-Auth-Token")
+            if not token or not secrets.compare_digest(token, self.auth_token):
                 self.send_error(401, "Unauthorized")
                 return
 
@@ -156,15 +170,16 @@ class PyServeHandler(SimpleHTTPRequestHandler):
             super().do_GET()
 
     def do_POST(self):
+        if self.auth_token:
+            token = self.headers.get("X-Auth-Token")
+            if not token or not secrets.compare_digest(token, self.auth_token):
+                self.send_error(401, "Unauthorized")
+                return
+
         if self.path == "/_upload" and self.upload_enabled:
             self._handle_upload()
         else:
             self.send_error(405, "Method Not Allowed")
-
-    def _get_query_param(self, name):
-        parsed = urllib.parse.urlparse(self.path)
-        params = urllib.parse.parse_qs(parsed.query)
-        return params.get(name, [None])[0]
 
     def _serve_qr(self):
         ip = get_local_ip()
@@ -176,7 +191,7 @@ class PyServeHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         html_out = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>QR</title>{STYLE}</head>
 <body><div class="container"><div class="card qr-section">
-<h2>Scan to Connect</h2><p style="margin:12px 0;color:#6b7280">{url}</p>
+<h2>Scan to Connect</h2><p style="margin:12px 0;color:#6b7280">{escape_html(url)}</p>
 <img src="{qr_data}" alt="QR" width="200">
 </div></div></body></html>"""
         self.wfile.write(html_out.encode())
@@ -200,7 +215,7 @@ class PyServeHandler(SimpleHTTPRequestHandler):
         for part in parts:
             if part:
                 current += f"/{part}"
-                breadcrumb += f' / <a href="{current}/">{escape_html(part)}</a>'
+                breadcrumb += f' / <a href="{escape_html(current)}/">{escape_html(part)}</a>'
 
         file_items = ""
         for entry in entries:
@@ -253,9 +268,9 @@ catch(e){s.innerHTML='<div class="status error">Network error</div>';}}}
 
         content = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>pyserve - {url_path}</title>{STYLE}</head>
+<title>pyserve - {escape_html(url_path)}</title>{STYLE}</head>
 <body><div class="container">
-<div class="header"><h1>pyserve</h1><p>{url}</p></div>
+<div class="header"><h1>pyserve</h1><p>{escape_html(url)}</p></div>
 <div class="card"><div class="breadcrumb">{breadcrumb}</div>
 <ul class="file-list">{file_items or '<li style="padding:20px;text-align:center;color:#9ca3af">Empty</li>'}</ul></div>
 {upload_html}</div></body></html>"""
@@ -268,6 +283,10 @@ catch(e){s.innerHTML='<div class="status error">Network error</div>';}}}
             return
 
         content_length = int(self.headers.get("Content-Length", 0))
+        if content_length > MAX_UPLOAD_SIZE:
+            self._json_response(False, f"File too large (max {MAX_UPLOAD_SIZE // 1024 // 1024}MB)")
+            return
+
         body = self.rfile.read(content_length)
 
         filename, file_data, upload_path = parse_multipart(content_type, body)
@@ -276,20 +295,33 @@ catch(e){s.innerHTML='<div class="status error">Network error</div>';}}}
             self._json_response(False, "No file")
             return
 
-        target_dir = self.translate_path(upload_path)
-        if not os.path.isdir(target_dir):
+        if len(file_data) > MAX_UPLOAD_SIZE:
+            self._json_response(False, f"File too large (max {MAX_UPLOAD_SIZE // 1024 // 1024}MB)")
+            return
+
+        base_dir = os.getcwd()
+        target_dir = safe_path(base_dir, upload_path)
+        if not target_dir or not os.path.isdir(target_dir):
             self._json_response(False, "Invalid directory")
             return
 
         filename = os.path.basename(filename)
+        if not filename or filename.startswith("."):
+            self._json_response(False, "Invalid filename")
+            return
+
         target_path = os.path.join(target_dir, filename)
+        target_real = os.path.realpath(target_path)
+        if not target_real.startswith(os.path.realpath(target_dir) + os.sep) and target_real != os.path.realpath(target_dir):
+            self._json_response(False, "Invalid path")
+            return
 
         try:
             with open(target_path, "wb") as f:
                 f.write(file_data)
-            self._json_response(True, f"Uploaded: {filename}")
+            self._json_response(True, f"Uploaded: {escape_html(filename)}")
         except Exception as e:
-            self._json_response(False, str(e))
+            self._json_response(False, "Upload failed")
 
     def _json_response(self, ok, message=""):
         self.send_response(200)
