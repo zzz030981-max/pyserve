@@ -4,7 +4,7 @@ build-backend = "setuptools.backends._legacy:_Backend"
 
 [project]
 name = "pyserve"
-version = "1.0.0"
+version = "1.0.2"
 description = "One-command local file sharing server with QR code"
 readme = "README.md"
 license = {text = "MIT"}
