@@ -3,7 +3,6 @@
 
 import argparse
 import base64
-import hmac
 import io
 import json
 import os
@@ -11,6 +10,7 @@ import secrets
 import socket
 import sys
 import urllib.parse
+from functools import partial
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 
 try:
@@ -19,7 +19,7 @@ try:
 except ImportError:
     HAS_QR = False
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100MB
 
@@ -163,7 +163,14 @@ class PyServeHandler(SimpleHTTPRequestHandler):
             self._serve_qr()
             return
 
+        # Check path traversal for file access
         path = self.translate_path(self.path)
+        base_real = os.path.realpath(os.getcwd())
+        real_path = os.path.realpath(path)
+        if not real_path.startswith(base_real + os.sep) and real_path != base_real:
+            self.send_error(403, "Forbidden")
+            return
+
         if os.path.isdir(path):
             self._serve_directory(path)
         else:
@@ -248,13 +255,14 @@ const dz=document.getElementById('dropZone');
 ['dragenter','dragover'].forEach(e=>dz.addEventListener(e,ev=>{ev.preventDefault();dz.classList.add('dragover')}));
 ['dragleave','drop'].forEach(e=>dz.addEventListener(e,ev=>{ev.preventDefault();dz.classList.remove('dragover')}));
 dz.addEventListener('drop',e=>uploadFiles(e.dataTransfer.files));
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
 async function uploadFiles(files){
 const s=document.getElementById('uploadStatus');
 for(const f of files){
 const fd=new FormData();fd.append('file',f);fd.append('path',decodeURIComponent(location.pathname));
 try{const r=await fetch('/_upload',{method:'POST',body:fd});const d=await r.json();
-if(d.ok){s.innerHTML='<div class="status success">Uploaded: '+f.name+'</div>';setTimeout(()=>location.reload(),500);}
-else{s.innerHTML='<div class="status error">'+(d.error||'Failed')+'</div>';}}
+if(d.ok){s.innerHTML='<div class="status success">Uploaded: '+esc(f.name)+'</div>';setTimeout(()=>location.reload(),500);}
+else{s.innerHTML='<div class="status error">'+esc(d.error||'Failed')+'</div>';}}
 catch(e){s.innerHTML='<div class="status error">Network error</div>';}}}
 </script>"""
 
@@ -279,12 +287,12 @@ catch(e){s.innerHTML='<div class="status error">Network error</div>';}}}
     def _handle_upload(self):
         content_type = self.headers.get("Content-Type", "")
         if "multipart/form-data" not in content_type:
-            self._json_response(False, "Invalid content type")
+            self._send_error_json(400, "Invalid content type")
             return
 
         content_length = int(self.headers.get("Content-Length", 0))
         if content_length > MAX_UPLOAD_SIZE:
-            self._json_response(False, f"File too large (max {MAX_UPLOAD_SIZE // 1024 // 1024}MB)")
+            self._send_error_json(413, f"File too large (max {MAX_UPLOAD_SIZE // 1024 // 1024}MB)")
             return
 
         body = self.rfile.read(content_length)
@@ -292,42 +300,56 @@ catch(e){s.innerHTML='<div class="status error">Network error</div>';}}}
         filename, file_data, upload_path = parse_multipart(content_type, body)
 
         if not filename or not file_data:
-            self._json_response(False, "No file")
+            self._send_error_json(400, "No file")
             return
 
         if len(file_data) > MAX_UPLOAD_SIZE:
-            self._json_response(False, f"File too large (max {MAX_UPLOAD_SIZE // 1024 // 1024}MB)")
+            self._send_error_json(413, f"File too large (max {MAX_UPLOAD_SIZE // 1024 // 1024}MB)")
             return
 
         base_dir = os.getcwd()
         target_dir = safe_path(base_dir, upload_path)
         if not target_dir or not os.path.isdir(target_dir):
-            self._json_response(False, "Invalid directory")
+            self._send_error_json(400, "Invalid directory")
             return
 
         filename = os.path.basename(filename)
         if not filename or filename.startswith("."):
-            self._json_response(False, "Invalid filename")
+            self._send_error_json(400, "Invalid filename")
+            return
+
+        # Block dangerous file types
+        dangerous_exts = {".exe", ".bat", ".cmd", ".com", ".msi", ".scr", ".ps1", ".vbs", ".js", ".jar", ".sh"}
+        ext = os.path.splitext(filename)[1].lower()
+        if ext in dangerous_exts:
+            self._send_error_json(400, "File type not allowed")
             return
 
         target_path = os.path.join(target_dir, filename)
         target_real = os.path.realpath(target_path)
-        if not target_real.startswith(os.path.realpath(target_dir) + os.sep) and target_real != os.path.realpath(target_dir):
-            self._json_response(False, "Invalid path")
+        dir_real = os.path.realpath(target_dir)
+        if not target_real.startswith(dir_real + os.sep) and target_real != dir_real:
+            self._send_error_json(400, "Invalid path")
             return
 
         try:
             with open(target_path, "wb") as f:
                 f.write(file_data)
             self._json_response(True, f"Uploaded: {escape_html(filename)}")
-        except Exception as e:
-            self._json_response(False, "Upload failed")
+        except Exception:
+            self._send_error_json(500, "Upload failed")
 
     def _json_response(self, ok, message=""):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(json.dumps({"ok": ok, "error": message if not ok else None}).encode())
+
+    def _send_error_json(self, code, message):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"ok": False, "error": message}).encode())
 
     def log_message(self, format, *args):
         pass
