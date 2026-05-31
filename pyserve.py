@@ -10,7 +10,7 @@ import secrets
 import socket
 import sys
 import urllib.parse
-from functools import partial
+
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 
 try:
@@ -290,7 +290,11 @@ catch(e){s.innerHTML='<div class="status error">Network error</div>';}}}
             self._send_error_json(400, "Invalid content type")
             return
 
-        content_length = int(self.headers.get("Content-Length", 0))
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except (ValueError, TypeError):
+            self._send_error_json(400, "Invalid Content-Length")
+            return
         if content_length > MAX_UPLOAD_SIZE:
             self._send_error_json(413, f"File too large (max {MAX_UPLOAD_SIZE // 1024 // 1024}MB)")
             return
